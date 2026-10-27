@@ -36,6 +36,7 @@ from openai.types.responses.response_output_item import (
     ProgramOutput,
 )
 from pydantic import BaseModel, StringConstraints, TypeAdapter, ValidationError
+from pydantic_core import PydanticSerializationError
 from typing_extensions import NotRequired, TypedDict, TypeVar
 
 from ._run_state_agent_identity import (
@@ -1716,10 +1717,7 @@ class RunState(Generic[TContext, TAgent]):
             )
 
         if hasattr(raw_context_payload, "model_dump"):
-            try:
-                serialized = raw_context_payload.model_dump(exclude_unset=True)
-            except TypeError:
-                serialized = raw_context_payload.model_dump()
+            serialized = _dump_pydantic_context(raw_context_payload)
             if not isinstance(serialized, Mapping):
                 raise UserError("RunState context model_dump must return a mapping.")
             # We can persist the data, but the original type is lost unless the caller rebuilds it.
@@ -2679,6 +2677,31 @@ def _serialize_agent_reference(
         if identity is not None and identity != agent.name:
             entry["identity"] = identity
     return entry
+
+
+def _dump_pydantic_context(model: Any) -> Any:
+    """Serialize a top-level Pydantic run context for a RunState snapshot.
+
+    Include every field, including defaults and in-place mutations, and convert values
+    such as UUID and datetime here. ``exclude_unset`` drops those fields because
+    appending to a default list or editing a default nested model does not mark the
+    parent field as set, and a Python-mode dump leaves non-JSON objects in the snapshot.
+
+    When JSON mode cannot represent the model, fall back to the previous Python dump so
+    those contexts do not start failing. That includes an arbitrary client object and
+    non-UTF-8 ``bytes``. Objects whose ``model_dump`` does not accept these keyword
+    arguments use the same fallback. JSON mode masks ``SecretStr`` values. Callers that
+    need a different representation can pass ``context_serializer``.
+    """
+    try:
+        return model.model_dump(mode="json")
+    except (PydanticSerializationError, UnicodeDecodeError, TypeError):
+        pass
+
+    try:
+        return model.model_dump(exclude_unset=True)
+    except TypeError:
+        return model.model_dump()
 
 
 def _ensure_json_compatible(value: Any) -> Any:

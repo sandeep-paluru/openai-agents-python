@@ -7,10 +7,12 @@ import importlib
 import json
 import logging
 import threading
+import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, TypeVar, cast
@@ -41,7 +43,7 @@ from openai.types.responses.response_output_item import (
 )
 from openai.types.responses.response_usage import InputTokensDetails
 from openai.types.responses.tool_param import Mcp
-from pydantic import BaseModel, ValidationError, model_serializer
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_serializer
 
 from agents import Agent, RunConfig, RunHooks, Runner, handoff, trace
 from agents._tool_invocation import tool_invocation_identity_and_scope
@@ -793,6 +795,215 @@ class TestRunState:
         assert context_meta["requires_deserializer"] is True
         assert context_meta["omitted"] is False
         assert any("Pydantic model" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_pydantic_context_preserves_inplace_changes_and_factory_values(self):
+        """A paused Pydantic context keeps mutated defaults and a stable factory value.
+
+        The approved tool must see the list and nested model that were changed in place,
+        and an untouched default_factory idempotency key must survive ``to_string``.
+        A snapshot that omitted those fields, as older writers did, still loads.
+        """
+
+        class Preferences(BaseModel):
+            channel: str = "sms"
+
+        class SupportContext(BaseModel):
+            customer_id: str
+            actions: list[str] = Field(default_factory=list)
+            preferences: Preferences = Field(default_factory=Preferences)
+            idempotency_key: str = Field(default_factory=lambda: uuid.uuid4().hex)
+
+        @function_tool
+        def record_preference(ctx: RunContextWrapper[Any], channel: str) -> str:
+            ctx.context.actions.append("verified identity")
+            ctx.context.preferences.channel = channel
+            return "recorded"
+
+        @function_tool(needs_approval=True)
+        def issue_refund(ctx: RunContextWrapper[Any], amount: int) -> str:
+            current = ctx.context
+            return (
+                f"refunded {amount}, notify via {current.preferences.channel}, "
+                f"actions={current.actions}"
+            )
+
+        model = ScriptedModel(
+            [
+                [
+                    get_function_tool_call(
+                        "record_preference",
+                        json.dumps({"channel": "email"}),
+                        call_id="call_1",
+                    )
+                ],
+                [
+                    get_function_tool_call(
+                        "issue_refund",
+                        json.dumps({"amount": 20}),
+                        call_id="call_2",
+                    )
+                ],
+                [get_final_output_message("done")],
+            ]
+        )
+        agent = Agent(name="support", model=model, tools=[record_preference, issue_refund])
+        live_context = SupportContext(customer_id="c-1")
+
+        result = await Runner.run(agent, "refund me", context=live_context)
+
+        assert live_context.model_fields_set == {"customer_id"}
+        assert live_context.actions == ["verified identity"]
+        assert live_context.preferences.channel == "email"
+        saved = result.to_state().to_string()
+        saved_context = json.loads(saved)["context"]["context"]
+        assert saved_context == {
+            "customer_id": "c-1",
+            "actions": ["verified identity"],
+            "preferences": {"channel": "email"},
+            "idempotency_key": live_context.idempotency_key,
+        }
+
+        state = await RunState.from_string(
+            agent,
+            saved,
+            context_deserializer=SupportContext.model_validate,
+        )
+        assert state._context is not None
+        assert state._context.context == live_context
+        for interruption in state.get_interruptions():
+            state.approve(interruption)
+
+        resumed = await Runner.run(agent, state)
+        outputs = [
+            item.output for item in resumed.new_items if isinstance(item, ToolCallOutputItem)
+        ]
+        assert outputs[-1] == "refunded 20, notify via email, actions=['verified identity']"
+
+        partial = json.loads(saved)
+        partial["context"]["context"] = {"customer_id": "c-1"}
+        restored_partial = await RunState.from_string(
+            agent,
+            json.dumps(partial),
+            context_deserializer=SupportContext.model_validate,
+        )
+        assert restored_partial._context is not None
+        partial_context = restored_partial._context.context
+        assert isinstance(partial_context, SupportContext)
+        assert partial_context.customer_id == "c-1"
+        assert partial_context.actions == []
+        assert partial_context.preferences.channel == "sms"
+
+    @pytest.mark.asyncio
+    async def test_pydantic_context_serializes_json_native_field_types(self):
+        """UUID, datetime, enum, and set fields round-trip through ``to_string``."""
+
+        class Color(Enum):
+            RED = "red"
+
+        class AuditContext(BaseModel):
+            request_id: uuid.UUID
+            started_at: datetime
+            color: Color = Color.RED
+            tags: set[str] = Field(default_factory=lambda: {"vip"})
+
+        @function_tool(needs_approval=True)
+        def delete_record(record_id: str) -> str:
+            return f"deleted {record_id}"
+
+        model = ScriptedModel(
+            [
+                [
+                    get_function_tool_call(
+                        "delete_record",
+                        json.dumps({"record_id": "r-1"}),
+                        call_id="call_1",
+                    )
+                ]
+            ]
+        )
+        agent = Agent(name="audit", model=model, tools=[delete_record])
+        context = AuditContext(
+            request_id=uuid.UUID(int=1),
+            started_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        result = await Runner.run(agent, "delete r-1", context=context)
+        state = result.to_state()
+        serialized_context = state.to_json()["context"]["context"]
+        assert serialized_context == {
+            "request_id": "00000000-0000-0000-0000-000000000001",
+            "started_at": "2026-01-01T00:00:00Z",
+            "color": "red",
+            "tags": ["vip"],
+        }
+        json.dumps(serialized_context)
+        saved = state.to_string()
+
+        restored = await RunState.from_string(
+            agent,
+            saved,
+            context_deserializer=AuditContext.model_validate,
+        )
+        assert restored._context is not None
+        assert restored._context.context == context
+
+    def test_unserializable_pydantic_context_keeps_previous_dump(self):
+        """Contexts JSON mode cannot dump still serialize the way they did before."""
+
+        class Client:
+            def __init__(self) -> None:
+                self.token = "synthetic-client-token"
+
+        class ClientContext(BaseModel):
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+            customer_id: str
+            client: Client = Field(default_factory=Client)
+
+        class BlobContext(BaseModel):
+            customer_id: str
+            payload: bytes = b"\xff\xfe"
+
+        agent = Agent(name="AgentMapping")
+        for context_model in (ClientContext(customer_id="c-1"), BlobContext(customer_id="c-1")):
+            state = make_state(
+                agent,
+                context=RunContextWrapper(context=context_model),
+                original_input="input",
+                max_turns=1,
+            )
+            saved = state.to_string()
+            assert "synthetic-client-token" not in saved
+            assert json.loads(saved)["context"]["context"] == {"customer_id": "c-1"}
+
+    def test_context_model_dump_without_json_mode_still_serializes(self):
+        """Duck-typed ``model_dump`` objects that reject JSON mode still round-trip."""
+
+        class LegacyContext:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def model_dump(self, exclude_unset: bool = True) -> dict[str, Any]:
+                assert exclude_unset is True
+                return {"value": self.value}
+
+        class BareContext:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def model_dump(self) -> dict[str, str]:
+                return {"value": self.value}
+
+        agent = Agent(name="AgentMapping")
+        for context_model in (LegacyContext(value="ok"), BareContext(value="ok")):
+            state = make_state(
+                agent,
+                context=RunContextWrapper(context=context_model),
+                original_input="input",
+                max_turns=1,
+            )
+            assert state.to_json()["context"]["context"] == {"value": "ok"}
+            assert json.loads(state.to_string())["context"]["context"] == {"value": "ok"}
 
     @pytest.mark.asyncio
     async def test_guardrail_results_round_trip(self):
